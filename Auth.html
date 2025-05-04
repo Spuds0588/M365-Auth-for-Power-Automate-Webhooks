@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>M365 Authenticated Trigger</title>
+    <!-- Load MSAL.js Browser library from CDN -->
+    <script src="https://alcdn.msauth.net/browser/2.38.0/js/msal-browser.min.js"
+        integrity="sha384-QrWTfjPHK2JmMGfbgzB1KlLzJJtsqRvzEEla/Q48hF5ngnF9KjQhQ6cQGkZyDCg8"
+        crossorigin="anonymous"></script> <!-- Note: Use the latest 2.x.x version available -->
+
+    <style>
+        body {
+            font-family: sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 80vh;
+            flex-direction: column;
+            text-align: center;
+            padding: 20px;
+        }
+        #loadingIndicator {
+            display: none; /* Hidden by default */
+            align-items: center;
+            flex-direction: column;
+        }
+        .spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            border-left-color: #09f;
+            margin-bottom: 15px;
+            animation: spin 1s ease infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        #errorMessage {
+            display: none; /* Hidden by default */
+            color: #D8000C; /* Error red */
+            background-color: #FFD2D2; /* Light red background */
+            border: 1px solid #D8000C;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 20px;
+            max-width: 600px;
+        }
+        #errorTitle {
+            font-weight: bold;
+            font-size: 1.1em;
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div id="loadingIndicator">
+        <div class="spinner"></div>
+        <p>Authenticating and preparing your request...</p>
+    </div>
+
+    <div id="errorMessage">
+        <div id="errorTitle"></div>
+        <div id="errorMessageContent"></div>
+    </div>
+
+    <script>
+        // ==============================================================
+        // == CONFIGURATION VARIABLES - EDIT THESE VALUES              ==
+        // ==============================================================
+
+        /**
+         * @description Azure AD Application (Client) ID for your registered SPA.
+         * @example "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+         */
+        const msalClientId = "YOUR_CLIENT_ID"; // <-- REPLACE THIS
+
+        /**
+         * @description Azure AD Directory (Tenant) ID where the app is registered.
+         * @example "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" or "yourtenant.onmicrosoft.com"
+         */
+        const msalTenantId = "YOUR_TENANT_ID"; // <-- REPLACE THIS
+
+        /**
+         * @description The *exact* URL where this HTML file will be hosted.
+         * Used by Azure AD to redirect back after authentication.
+         * @example "https://auth.yourorg.com/trigger.html"
+         * @default window.location.origin + window.location.pathname
+         */
+        const msalRedirectUrl = window.location.origin + window.location.pathname;
+
+        /**
+         * @description The name of the URL parameter that holds the encoded Power Automate Webhook URL.
+         * @example "flowUrl", "target", "callback"
+         * @default "webhookUrl"
+         */
+        const webhookUrlParamName = "webhookUrl";
+
+        /**
+         * @description The name of the URL parameter to append the M365 ID token to when calling the webhook.
+         * @example "token", "authToken", "jwt"
+         * @default "id_token"
+         */
+        const idTokenParamName = "id_token";
+
+        /**
+         * @description Title text/HTML displayed when an authentication error occurs.
+         * @default "Authentication Failed"
+         */
+        const authErrorTitle = "Authentication Failed";
+
+        /**
+         * @description Message text/HTML displayed when an authentication error occurs.
+         * Provide instructions or contact information.
+         * @default 'Login was unsuccessful...'
+         */
+        const authErrorMessage = `Login was unsuccessful. Please ensure you are using the correct M365 account and have the necessary permissions. If the problem persists, please contact your administrator or Technical Support at <a href='mailto:support@example.com'>support@example.com</a>.`; // <-- Customize contact info
+
+        /**
+         * @description Message text/HTML displayed when the required webhook URL parameter is missing.
+         * @default 'Configuration Error...'
+         */
+        const configErrorTitle = "Configuration Error";
+        const configErrorMessage = `The required '${webhookUrlParamName}' parameter is missing in the URL. Please check the link you used. Example: .../trigger.html?${webhookUrlParamName}=ENCODED_URL`;
+
+        // ==============================================================
+        // == APPLICATION LOGIC - DO NOT EDIT BELOW THIS LINE          ==
+        // ==============================================================
+
+        // --- DOM Elements ---
+        const loadingIndicator = document.getElementById('loadingIndicator');
+        const errorMessageContainer = document.getElementById('errorMessage');
+        const errorTitleElement = document.getElementById('errorTitle');
+        const errorMessageContentElement = document.getElementById('errorMessageContent');
+
+        // --- Helper Functions ---
+        function showLoading(show = true) {
+            loadingIndicator.style.display = show ? 'flex' : 'none';
+            if (show) errorMessageContainer.style.display = 'none'; // Hide error if showing loading
+        }
+
+        function showError(title, message, errorDetails = null) {
+            showLoading(false);
+            errorTitleElement.innerHTML = title;
+            errorMessageContentElement.innerHTML = message;
+            errorMessageContainer.style.display = 'block';
+            console.error("Authentication/Configuration Error:", errorDetails || message);
+        }
+
+        function getQueryParams() {
+            const params = {};
+            const queryString = window.location.search.substring(1);
+            const regex = /([^&=]+)=([^&]*)/g;
+            let m;
+            while (m = regex.exec(queryString)) {
+                // Use decodeURIComponent on both key and value, just in case
+                // Keys usually aren't encoded, but values often are.
+                try {
+                    params[decodeURIComponent(m[1])] = decodeURIComponent(m[2].replace(/\+/g, ' '));
+                } catch (e) {
+                    console.warn(`Could not decode query parameter pair: ${m[0]}`, e);
+                    // Store raw if decoding fails, though this might cause issues later
+                    params[decodeURIComponent(m[1])] = m[2];
+                }
+            }
+            return params;
+        }
+
+        // --- MSAL Configuration ---
+        const msalConfig = {
+            auth: {
+                clientId: msalClientId,
+                authority: `https://login.microsoftonline.com/${msalTenantId}`,
+                redirectUri: msalRedirectUrl,
+                navigateToLoginRequestUrl: false, // Prevent MSAL from navigating away before we process params
+            },
+            cache: {
+                cacheLocation: "sessionStorage", // Or "localStorage" if persistence across sessions is needed
+                storeAuthStateInCookie: false, // Set to true for IE11 support, otherwise false
+            },
+            system: {
+                loggerOptions: {
+                    loggerCallback: (level, message, containsPii) => {
+                        if (containsPii) { return; }
+                        switch (level) {
+                            // case msal.LogLevel.Error: console.error(message); return; // Handled in catch blocks
+                            case msal.LogLevel.Info: console.info(message); return;
+                            case msal.LogLevel.Verbose: console.debug(message); return;
+                            case msal.LogLevel.Warning: console.warn(message); return;
+                        }
+                    }
+                }
+            }
+        };
+
+        // --- MSAL Instance & Requests ---
+        const msalInstance = new msal.PublicClientApplication(msalConfig);
+        const loginRequest = {
+            scopes: ["openid", "profile", "email"] // Standard scopes for ID token
+        };
+        const tokenRequest = {
+            scopes: ["openid", "profile", "email"], // Request scopes for the token
+            // forceRefresh: false // Optionally force refresh
+        };
+
+        // --- Main Application Flow ---
+        let targetWebhookUrl = null;
+        let otherParams = {};
+
+        function parseInitialUrl() {
+            const queryParams = getQueryParams();
+            const encodedWebhookUrl = queryParams[webhookUrlParamName];
+
+            if (!encodedWebhookUrl) {
+                showError(configErrorTitle, configErrorMessage);
+                return false; // Stop execution
+            }
+
+            try {
+                targetWebhookUrl = decodeURIComponent(encodedWebhookUrl);
+            } catch (e) {
+                 showError("URL Decoding Error", `Could not decode the ${webhookUrlParamName} parameter. Please check the link.`, e);
+                 return false; // Stop execution
+            }
+
+
+            // Collect other parameters
+            for (const key in queryParams) {
+                if (key !== webhookUrlParamName) {
+                    otherParams[key] = queryParams[key]; // Value is already decoded by getQueryParams
+                }
+            }
+            return true; // Parsing successful
+        }
+
+        function acquireToken(account) {
+            showLoading(true);
+            tokenRequest.account = account;
+
+            msalInstance.acquireTokenSilent(tokenRequest)
+                .then(response => {
+                    console.log("Token acquired silently");
+                    redirectToWebhook(response.idToken, otherParams);
+                })
+                .catch(error => {
+                    console.warn("Silent token acquisition failed: ", error);
+                    if (error instanceof msal.InteractionRequiredAuthError) {
+                        // Fallback to interactive method if silent fails
+                        console.log("Interaction required, redirecting to acquire token...");
+                        msalInstance.acquireTokenRedirect(tokenRequest).catch(redirectError => {
+                             // Catch errors during the *initiation* of the redirect
+                            showError(authErrorTitle, authErrorMessage, redirectError);
+                        });
+                    } else {
+                         // Other errors (configuration, network, etc.)
+                        showError(authErrorTitle, authErrorMessage, error);
+                    }
+                });
+        }
+
+        function redirectToWebhook(idToken, params) {
+            let finalTargetUrl = targetWebhookUrl;
+
+            // Check if the base webhook URL already has query params
+            const separator = finalTargetUrl.includes('?') ? '&' : '?';
+
+            // Append the ID token
+            finalTargetUrl += `${separator}${encodeURIComponent(idTokenParamName)}=${encodeURIComponent(idToken)}`;
+
+            // Append other original parameters
+            for (const key in params) {
+                finalTargetUrl += `&${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`;
+            }
+
+            console.log(`Redirecting to: ${finalTargetUrl}`);
+            // Perform the redirect
+            window.location.href = finalTargetUrl;
+
+            // Keep loading indicator visible until browser navigates away
+            showLoading(true);
+        }
+
+        function signIn() {
+             console.log("No active account found or interaction required. Initiating login redirect.");
+             msalInstance.loginRedirect(loginRequest).catch(error => {
+                // Catch errors during the *initiation* of the redirect
+                showError(authErrorTitle, authErrorMessage, error);
+             });
+        }
+
+         // --- Entry Point ---
+        // First, parse URL params to ensure webhook URL is present before any MSAL ops
+        if (parseInitialUrl()) {
+             // Handle the redirect promise - this resolves if navigated back from login/token acquisition
+            msalInstance.handleRedirectPromise()
+                .then(response => {
+                     console.log("handleRedirectPromise resolved.");
+                    let account = null;
+                    if (response) {
+                        // Successfully handled redirect, response object contains tokens/account info
+                        account = response.account;
+                        console.log("Obtained account info from redirect response.");
+                    } else {
+                        // No redirect response, check for existing accounts
+                        const currentAccounts = msalInstance.getAllAccounts();
+                        if (currentAccounts.length > 0) {
+                            account = currentAccounts[0]; // Assume first account is the correct one
+                            console.log("Found existing logged-in account.");
+                        }
+                    }
+
+                    if (account) {
+                        console.log("Account found, attempting to acquire token...");
+                        acquireToken(account);
+                    } else {
+                         // No account logged in and not returning from a redirect that provided one
+                        signIn(); // Initiate login
+                    }
+                })
+                .catch(error => {
+                    // Handle errors from redirect processing (e.g., state mismatch, hash errors)
+                    showError(authErrorTitle, authErrorMessage, error);
+                });
+        }
+         // Else: parseInitialUrl already showed an error, so do nothing more.
+
+    </script>
+</body>
+</html>
